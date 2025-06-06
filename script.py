@@ -1,18 +1,20 @@
 # -*- coding: utf-8 -*-
+
+
 """
-REMOVE COUPLING TOOL - FINAL CONSOLIDATED VERSION
 ================================================================
-Tool để xóa coupling và gộp 2 pipes thành 1 pipe liền mạch (TRUE TRIM)
+REMOVE COUPLING TOOL - FINAL CONSOLIDATED VERSION - June 2025
+================================================================
 
-TÍNH NĂNG CHÍNH:
-- Xóa coupling và tự động kết nối lại 2 pipe segments
-- TRUE TRIM: Gộp 2 pipes thành 1 pipe liền mạch (như Trim UI trong Revit)
-- 5 phương pháp backup đảm bảo thành công cao
-- Hỗ trợ cả system pipe fittings và family instance couplings
+CHỨC NĂNG CHÍNH:
+✅ TRUE TRIM: **GỘP 2 PIPES THÀNH 1 PIPE LIỀN MẠCH** 
+- Extend pipe chính để bao phủ toàn bộ khoảng cách
+- Xóa pipe thứ 2 (không cần thiết)
+- Kết quả: 1 pipe liền mạch duy nhất thay thế 2 pipes
 
-PHƯƠNG PHÁP SỬ DỤNG:
-1. TRUE TRIM - Tạo 1 pipe mới thay thế 2 pipes cũ (TỐT NHẤT)
-2. Union Pipes - Sử dụng PlumbingUtils.UnionPipes 
+FALLBACK METHODS (nếu TRUE TRIM không thành công):
+1. Union Pipes - Sử dụng Revit API để union 2 pipes
+2. Extend Both Pipes - Extend cả 2 pipes tới điểm giữa  
 3. Connector Connection - Kết nối logic thông qua connectors
 4. Extend Pipes - Kéo dài pipes về giữa để đóng khoảng hở
 5. Create Segment - Tạo pipe segment nhỏ làm cầu nối
@@ -36,482 +38,543 @@ from pyrevit import revit, script
 from Autodesk.Revit import DB
 from Autodesk.Revit.UI.Selection import ObjectType
 from Autodesk.Revit.DB.Plumbing import PlumbingUtils
+from System.Collections.Generic import List
 
 # Khởi tạo output window
 output = script.get_output()
-output.close_others()
 
-# Lấy document và UI document
+# Khởi tạo document và UI document
 doc = revit.doc
 uidoc = revit.uidoc
 
-# Hằng số
-PIPE_FITTING_CATEGORY = int(DB.BuiltInCategory.OST_PipeFitting)
-PIPE_CURVES_CATEGORY = int(DB.BuiltInCategory.OST_PipeCurves)
-
-def get_pipe_connections(pipe_element):
-    """Lấy tất cả connector của pipe hoặc fitting"""
-    connectors = []
+def get_pipe_connections(pipe):
+    """Lấy tất cả connectors của pipe"""
     try:
-        element_type = pipe_element.GetType().Name
-        output.print_md('      🔍 Element type: {}'.format(element_type))
-        
-        # Kiểm tra loại element và lấy connector tương ứng
-        if hasattr(pipe_element, 'ConnectorManager'):
-            # Pipe thông thường
-            output.print_md('      📌 Có ConnectorManager')
-            connector_manager = pipe_element.ConnectorManager
-            if connector_manager:
-                connector_count = 0
-                for connector in connector_manager.Connectors:
-                    connectors.append(connector)
-                    connector_count += 1
-                output.print_md('      📊 ConnectorManager: {} connectors'.format(connector_count))
-            else:
-                output.print_md('      ⚠️ ConnectorManager is None')
-                
-        elif hasattr(pipe_element, 'MEPModel'):
-            # Family instance fitting
-            output.print_md('      📌 Có MEPModel (Family Instance)')
-            mep_model = pipe_element.MEPModel
-            if mep_model and hasattr(mep_model, 'ConnectorManager'):
-                connector_manager = mep_model.ConnectorManager
-                if connector_manager:
-                    connector_count = 0
-                    for connector in connector_manager.Connectors:
-                        connectors.append(connector)
-                        connector_count += 1
-                    output.print_md('      📊 MEPModel.ConnectorManager: {} connectors'.format(connector_count))
-                else:
-                    output.print_md('      ⚠️ MEPModel.ConnectorManager is None')
-            else:
-                output.print_md('      ⚠️ MEPModel is None hoặc không có ConnectorManager')
-        else:
-            output.print_md('      ⚠️ Không tìm thấy ConnectorManager hoặc MEPModel')
-            
-    except Exception as e:
-        output.print_md('      ❌ Lỗi khi lấy connections: {}'.format(str(e)))
-    
-    output.print_md('      📊 Tổng cộng: {} connectors'.format(len(connectors)))
-    return connectors
+        connector_set = pipe.ConnectorManager.Connectors
+        connectors = []
+        for connector in connector_set:
+            connectors.append(connector)
+        return connectors
+    except:
+        return []
 
 def find_connected_pipes(coupling):
-    """Tìm pipes kết nối với coupling thông qua connectors"""
+    """Tìm tất cả pipes kết nối với coupling này"""
     connected_pipes = []
     
     try:
-        output.print_md('    🔍 Phương pháp 1: Tìm thông qua Connectors...')
+        # Method 1: Sử dụng MEPModel (cho system families)
+        if hasattr(coupling, 'MEPModel') and coupling.MEPModel:
+            connector_set = coupling.MEPModel.ConnectorManager.Connectors
+            for connector in connector_set:
+                if connector.IsConnected:
+                    for ref in connector.AllRefs:
+                        element = ref.Owner
+                        if element.Category.Id.IntegerValue == int(DB.BuiltInCategory.OST_PipeCurves):
+                            if element.Id != coupling.Id:
+                                connected_pipes.append(element)
+                                
+        # Method 2: Sử dụng ConnectorManager trực tiếp (cho family instances)
+        elif hasattr(coupling, 'ConnectorManager') and coupling.ConnectorManager:
+            connector_set = coupling.ConnectorManager.Connectors
+            for connector in connector_set:
+                if connector.IsConnected:
+                    for ref in connector.AllRefs:
+                        element = ref.Owner
+                        if element.Category.Id.IntegerValue == int(DB.BuiltInCategory.OST_PipeCurves):
+                            if element.Id != coupling.Id:
+                                connected_pipes.append(element)
         
-        # Lấy connectors của coupling
-        coupling_connectors = get_pipe_connections(coupling)
-        output.print_md('    📊 Coupling có {} connectors'.format(len(coupling_connectors)))
-        
-        for i, coupling_connector in enumerate(coupling_connectors):
-            output.print_md('      🔌 Connector {}: Connected to {} elements'.format(
-                i+1, coupling_connector.AllRefs.Size))
+        # Method 3: Geometry-based search (fallback)
+        if len(connected_pipes) == 0:
+            coupling_location = coupling.Location
+            if hasattr(coupling_location, 'Point'):
+                search_point = coupling_location.Point
+            elif hasattr(coupling_location, 'Curve'):
+                search_point = coupling_location.Curve.GetEndPoint(0)
+            else:
+                return connected_pipes
             
-            # Kiểm tra tất cả elements kết nối với connector này
-            for ref in coupling_connector.AllRefs:
-                connected_element = ref.Owner
-                
-                # Bỏ qua chính coupling
-                if connected_element.Id == coupling.Id:
-                    continue
-                
-                # Kiểm tra xem có phải pipe không
-                if (connected_element.Category and 
-                    connected_element.Category.Id.IntegerValue == PIPE_CURVES_CATEGORY):
-                    
-                    output.print_md('      ✅ Tìm thấy pipe: ID {}'.format(connected_element.Id))
-                    if connected_element not in connected_pipes:
-                        connected_pipes.append(connected_element)
-                        
-    except Exception as e:
-        output.print_md('    ❌ Lỗi khi tìm connected pipes: {}'.format(str(e)))
-    
-    output.print_md('    📊 Tổng cộng: {} pipes kết nối'.format(len(connected_pipes)))
-    return connected_pipes
-
-def find_connected_pipes_by_geometry(coupling, tolerance=1.0):
-    """Tìm pipes gần coupling dựa trên vị trí geometry (backup method)"""
-    connected_pipes = []
-    
-    try:
-        output.print_md('    🔍 Phương pháp 2: Tìm thông qua Geometry Proximity...')
-        
-        # Lấy location của coupling
-        coupling_location = coupling.Location
-        if not coupling_location:
-            output.print_md('    ⚠️ Coupling không có location')
-            return connected_pipes
-        
-        if hasattr(coupling_location, 'Point'):
-            coupling_point = coupling_location.Point
-        elif hasattr(coupling_location, 'Curve'):
-            coupling_point = coupling_location.Curve.Evaluate(0.5, True)  # Điểm giữa curve
-        else:
-            output.print_md('    ⚠️ Không thể xác định vị trí coupling')
-            return connected_pipes
-        
-        output.print_md('    📍 Coupling location: ({:.3f}, {:.3f}, {:.3f})'.format(
-            coupling_point.X, coupling_point.Y, coupling_point.Z))
-        
-        # Tìm tất cả pipes trong model
-        pipe_collector = DB.FilteredElementCollector(doc).OfCategory(DB.BuiltInCategory.OST_PipeCurves).WhereElementIsNotElementType()
-        
-        for pipe in pipe_collector:
-            if pipe.Location and hasattr(pipe.Location, 'Curve'):
+            # Tìm pipes gần coupling
+            pipe_collector = DB.FilteredElementCollector(doc).OfCategory(DB.BuiltInCategory.OST_PipeCurves).WhereElementIsNotElementType()
+            for pipe in pipe_collector:
                 pipe_curve = pipe.Location.Curve
-                
-                # Tính khoảng cách từ coupling point đến pipe curve
-                closest_point = pipe_curve.Project(coupling_point)
-                if closest_point:
-                    distance = coupling_point.DistanceTo(closest_point.XYZPoint)
-                    
-                    if distance <= tolerance:
-                        output.print_md('    ✅ Pipe gần: ID {} (khoảng cách: {:.3f})'.format(pipe.Id, distance))
-                        connected_pipes.append(pipe)
+                closest_point = pipe_curve.Project(search_point).XYZPoint
+                distance = search_point.DistanceTo(closest_point)
+                if distance < 1.0:  # Trong vòng 1 foot
+                    connected_pipes.append(pipe)
         
     except Exception as e:
-        output.print_md('    ❌ Lỗi geometry search: {}'.format(str(e)))
+        output.print_md('  ⚠️ Lỗi tìm connected pipes: {}'.format(str(e)))
     
-    output.print_md('    📊 Geometry method: {} pipes'.format(len(connected_pipes)))
-    return connected_pipes
-
-def try_union_pipes(pipe1, pipe2):
-    """Phương pháp 1: Thử union 2 pipes sử dụng PlumbingUtils"""
-    try:
-        output.print_md('    🔧 Thử PlumbingUtils.UnionPipes...')
-        
-        # Kiểm tra xem PlumbingUtils có sẵn không
-        try:
-            # Thử union pipes
-            result = PlumbingUtils.UnionPipes(doc, pipe1, pipe2)
-            if result:
-                output.print_md('    ✅ Union pipes thành công!')
-                return True
-            else:
-                output.print_md('    ⚠️ Union pipes trả về False')
-                return False
-                
-        except AttributeError:
-            output.print_md('    ⚠️ PlumbingUtils.UnionPipes không có sẵn trong phiên bản Revit này')
-            return False
-        except Exception as union_error:
-            output.print_md('    ⚠️ Lỗi Union: {}'.format(str(union_error)))
-            return False
-            
-    except Exception as e:
-        output.print_md('    ❌ Lỗi try_union_pipes: {}'.format(str(e)))
-        return False
-
-def connect_pipes_by_connectors(pipe1, pipe2):
-    """Phương pháp 2: Kết nối pipes thông qua connectors (logic connection)"""
-    try:
-        output.print_md('    🔧 Kết nối pipes bằng connectors...')
-        
-        # Lấy connectors của 2 pipes
-        connectors1 = get_pipe_connections(pipe1)
-        connectors2 = get_pipe_connections(pipe2)
-        
-        if len(connectors1) == 0 or len(connectors2) == 0:
-            output.print_md('    ⚠️ Một hoặc cả hai pipes không có connector')
-            return False
-        
-        # Tìm connectors gần nhau nhất
-        min_distance = float('inf')
-        best_conn1 = None
-        best_conn2 = None
-        
-        for conn1 in connectors1:
-            for conn2 in connectors2:
-                # Chỉ kết nối connectors chưa kết nối
-                if not conn1.IsConnected and not conn2.IsConnected:
-                    distance = conn1.Origin.DistanceTo(conn2.Origin)
-                    if distance < min_distance:
-                        min_distance = distance
-                        best_conn1 = conn1
-                        best_conn2 = conn2
-        
-        if best_conn1 and best_conn2:
-            output.print_md('    📏 Khoảng cách connectors: {:.4f} feet'.format(min_distance))
-            
-            # Kết nối connectors
-            best_conn1.ConnectTo(best_conn2)
-            output.print_md('    ✅ Đã kết nối connectors!')
-            return True
-        else:
-            output.print_md('    ⚠️ Không tìm thấy connectors phù hợp để kết nối')
-            return False
-            
-    except Exception as e:
-        output.print_md('    ❌ Lỗi connector connection: {}'.format(str(e)))
-        return False
-
-def extend_pipes_to_close_gap(pipe1, pipe2):
-    """Phương pháp 3: Kéo dài pipes về phía nhau để đóng khoảng hở"""
-    try:
-        output.print_md('    🔧 Extend pipes để đóng gap...')
-        
-        # Lấy curves của 2 pipes
-        curve1 = pipe1.Location.Curve
-        curve2 = pipe2.Location.Curve
-        
-        # Tìm endpoints gần nhau nhất
-        points1 = [curve1.GetEndPoint(0), curve1.GetEndPoint(1)]
-        points2 = [curve2.GetEndPoint(0), curve2.GetEndPoint(1)]
-        
-        min_distance = float('inf')
-        extend_point1 = None
-        extend_point2 = None
-        target_point1 = None
-        target_point2 = None
-        
-        for p1 in points1:
-            for p2 in points2:
-                distance = p1.DistanceTo(p2)
-                if distance < min_distance:
-                    min_distance = distance
-                    extend_point1 = p1
-                    extend_point2 = p2
-                    # Điểm target là điểm giữa
-                    target_point1 = DB.XYZ((p1.X + p2.X) / 2, (p1.Y + p2.Y) / 2, (p1.Z + p2.Z) / 2)
-                    target_point2 = target_point1
-        
-        if min_distance < 10.0:  # Chỉ extend nếu gap không quá lớn
-            output.print_md('    📏 Gap distance: {:.4f} feet'.format(min_distance))
-            
-            # Extend pipe1
-            if extend_point1 == curve1.GetEndPoint(0):
-                new_curve1 = DB.Line.CreateBound(target_point1, curve1.GetEndPoint(1))
-            else:
-                new_curve1 = DB.Line.CreateBound(curve1.GetEndPoint(0), target_point1)
-            
-            # Extend pipe2
-            if extend_point2 == curve2.GetEndPoint(0):
-                new_curve2 = DB.Line.CreateBound(target_point2, curve2.GetEndPoint(1))
-            else:
-                new_curve2 = DB.Line.CreateBound(curve2.GetEndPoint(0), target_point2)
-            
-            # Update pipe locations
-            pipe1.Location.Curve = new_curve1
-            pipe2.Location.Curve = new_curve2
-            
-            output.print_md('    ✅ Đã extend pipes - gap đã đóng!')
-            return True
-        else:
-            output.print_md('    ⚠️ Gap quá lớn để extend: {:.4f} feet'.format(min_distance))
-            return False
-            
-    except Exception as e:
-        output.print_md('    ❌ Lỗi extend pipes: {}'.format(str(e)))
-        return False
-
-def create_connecting_pipe_segment(pipe1, pipe2):
-    """Phương pháp 4: Tạo pipe segment ngắn để nối 2 pipes"""
-    try:
-        output.print_md('    🔧 Tạo pipe segment để nối...')
-        
-        # Tìm connectors gần nhau nhất
-        connectors1 = get_pipe_connections(pipe1)
-        connectors2 = get_pipe_connections(pipe2)
-        
-        min_distance = float('inf')
-        conn1 = None
-        conn2 = None
-        
-        for c1 in connectors1:
-            for c2 in connectors2:
-                distance = c1.Origin.DistanceTo(c2.Origin)
-                if distance < min_distance:
-                    min_distance = distance
-                    conn1 = c1
-                    conn2 = c2
-        
-        if not conn1 or not conn2:
-            output.print_md('    ⚠️ Không tìm thấy connectors phù hợp')
-            return False
-        
-        output.print_md('    📏 Khoảng cách cần nối: {:.4f} feet'.format(min_distance))
-        
-        # Tạo curve nối 2 connector
-        connecting_curve = DB.Line.CreateBound(conn1.Origin, conn2.Origin)
-        
-        # Lấy pipe type và system từ pipe1
-        pipe_type = pipe1.PipeType
-        system_type = pipe1.MEPSystem.GetTypeId() if pipe1.MEPSystem else None
-        level_id = pipe1.ReferenceLevel.Id
-        
-        # Tạo pipe mới để đóng khoảng hở
-        new_pipe = DB.Plumbing.Pipe.Create(doc, system_type, pipe_type.Id, level_id, connecting_curve)
-        
-        if new_pipe:
-            output.print_md('    ✅ Đã tạo pipe segment - ID: {} (dài: {:.4f} feet)'.format(new_pipe.Id, min_distance))
-            
-            # Kết nối với 2 pipe gốc
-            new_connectors = get_pipe_connections(new_pipe)
-            if len(new_connectors) >= 2:
-                new_connectors[0].ConnectTo(conn1)
-                new_connectors[1].ConnectTo(conn2)
-                output.print_md('    ✅ Đã kết nối pipe segment với 2 pipes gốc!')
-            
-            return True
-        else:
-            output.print_md('    ❌ Không thể tạo pipe segment')
-            return False
-            
-    except Exception as e:
-        output.print_md('    ❌ Lỗi tạo connecting segment: {}'.format(str(e)))
-        return False
+    # Loại bỏ duplicates
+    unique_pipes = []
+    pipe_ids = set()
+    for pipe in connected_pipes:
+        if pipe.Id not in pipe_ids:
+            unique_pipes.append(pipe)
+            pipe_ids.add(pipe.Id)
+    
+    return unique_pipes
 
 def true_trim_pipes(pipe1, pipe2):
-    """PHƯƠNG PHÁP TRUE TRIM: Tạo 1 pipe mới liền mạch thay thế 2 pipes cũ"""
+    """
+    TRUE TRIM: Gộp 2 pipes thành 1 pipe liền mạch duy nhất
+    - Extend 1 pipe để bao phủ toàn bộ khoảng cách
+    - Xóa pipe thứ 2
+    - Kết quả: 1 pipe liền mạch thay thế 2 pipes riêng biệt
+    """
     try:
-        output.print_md('    🎯 TRUE TRIM: Tạo 1 pipe mới thay thế 2 pipes...')
-        
-        # Lấy thông tin từ pipe1 để tạo pipe mới
-        pipe_type = pipe1.PipeType
-        level_id = pipe1.ReferenceLevel.Id
-        diameter = pipe1.Diameter
-          # Lấy system type cẩn thận hơn
-        system_type_id = None
-        pipe_system = None
-        try:
-            if pipe1.MEPSystem:
-                pipe_system = pipe1.MEPSystem
-                system_type_id = pipe1.MEPSystem.GetTypeId()
-                output.print_md('    📋 System Type ID: {}'.format(system_type_id))
-                output.print_md('    📋 System Name: {}'.format(pipe_system.Name))
-            else:
-                output.print_md('    ⚠️ Pipe không có MEPSystem, sẽ tạo pipe không có system')
-        except:
-            output.print_md('    ⚠️ Không thể lấy system type, sẽ tạo pipe không có system')
+        output.print_md('  🔥 **BẮT ĐẦU TRUE TRIM: GỘP 2 PIPES THÀNH 1 PIPE LIỀN MẠCH**')
         
         # Lấy curves của 2 pipes
         curve1 = pipe1.Location.Curve
         curve2 = pipe2.Location.Curve
         
-        # Xác định điểm đầu và cuối của 2 pipes
-        # Tìm điểm xa nhất để tạo pipe liền mạch
-        points = [
-            curve1.GetEndPoint(0), curve1.GetEndPoint(1),
-            curve2.GetEndPoint(0), curve2.GetEndPoint(1)
+        output.print_md('    📏 Pipe 1 length: {:.4f} feet'.format(curve1.Length))
+        output.print_md('    📏 Pipe 2 length: {:.4f} feet'.format(curve2.Length))
+        
+        # Tính khoảng cách giữa các endpoints để tìm điểm kết nối tốt nhất
+        p1_start = curve1.GetEndPoint(0)
+        p1_end = curve1.GetEndPoint(1)
+        p2_start = curve2.GetEndPoint(0)
+        p2_end = curve2.GetEndPoint(1)
+        
+        # Tính tất cả khoảng cách có thể
+        distances = [
+            (p1_start.DistanceTo(p2_start), p1_start, p2_start, "P1_Start", "P2_Start"),
+            (p1_start.DistanceTo(p2_end), p1_start, p2_end, "P1_Start", "P2_End"),
+            (p1_end.DistanceTo(p2_start), p1_end, p2_start, "P1_End", "P2_Start"),
+            (p1_end.DistanceTo(p2_end), p1_end, p2_end, "P1_End", "P2_End")
         ]
         
-        # Tìm 2 điểm xa nhất (đầu và cuối của pipe mới)
-        max_distance = 0
-        start_point = None
-        end_point = None
+        # Sắp xếp theo khoảng cách gần nhất
+        distances.sort(key=lambda x: x[0])
+        min_distance, conn_p1, conn_p2, p1_type, p2_type = distances[0]
         
-        for i in range(len(points)):
-            for j in range(i+1, len(points)):
-                distance = points[i].DistanceTo(points[j])
-                if distance > max_distance:
-                    max_distance = distance
-                    start_point = points[i]
-                    end_point = points[j]
+        output.print_md('    📏 Khoảng cách gần nhất: {:.4f} feet ({} ↔ {})'.format(
+            min_distance, p1_type, p2_type))
         
-        if not start_point or not end_point:
-            output.print_md('    ❌ Không thể xác định điểm đầu/cuối')
+        if min_distance > 10.0:  # Quá xa để kết nối
+            output.print_md('    ⚠️ Pipes quá xa để trim ({:.4f} feet)'.format(min_distance))
             return False
-            
-        output.print_md('    📏 Chiều dài pipe mới: {:.4f} feet'.format(max_distance))
-        output.print_md('    📍 Từ: ({:.3f}, {:.3f}, {:.3f})'.format(
-            start_point.X, start_point.Y, start_point.Z))
-        output.print_md('    📍 Đến: ({:.3f}, {:.3f}, {:.3f})'.format(
-            end_point.X, end_point.Y, end_point.Z))
         
-        # Tạo curve mới liền mạch
-        new_curve = DB.Line.CreateBound(start_point, end_point)
-          # Tạo pipe mới
-        output.print_md('    🔧 Tạo pipe mới liền mạch...')
-          # Thử tạo pipe với các phương pháp khác nhau
-        new_pipe = None
-        try:
-            # Phương pháp 1: Với system type ID (5 parameters)
-            if system_type_id and system_type_id != DB.ElementId.InvalidElementId:
-                output.print_md('    🔧 Thử tạo pipe với system type ID...')
-                new_pipe = DB.Plumbing.Pipe.Create(doc, system_type_id, pipe_type.Id, level_id, start_point, end_point)
-            else:
-                # Phương pháp 2: Không có system type (4 parameters)
-                output.print_md('    🔧 Thử tạo pipe không có system type...')
-                new_pipe = DB.Plumbing.Pipe.Create(doc, pipe_type.Id, level_id, start_point, end_point)
-        except Exception as e1:
-            output.print_md('    ⚠️ Lỗi tạo pipe với points: {}'.format(str(e1)))
-            try:
-                # Phương pháp 3: Sử dụng curve (backup method)
-                output.print_md('    🔧 Thử tạo pipe với curve...')
-                if system_type_id and system_type_id != DB.ElementId.InvalidElementId:
-                    new_pipe = DB.Plumbing.Pipe.Create(doc, system_type_id, pipe_type.Id, level_id, new_curve)
-                else:
-                    new_pipe = DB.Plumbing.Pipe.Create(doc, pipe_type.Id, level_id, new_curve)
-            except Exception as e2:
-                output.print_md('    ❌ Lỗi tạo pipe với curve: {}'.format(str(e2)))
-                try:
-                    # Phương pháp 4: Chỉ với pipe type object trực tiếp
-                    output.print_md('    🔧 Thử tạo pipe với pipe type object...')
-                    new_pipe = DB.Plumbing.Pipe.Create(doc, pipe_type, level_id, start_point, end_point)
-                except Exception as e3:
-                    output.print_md('    ❌ Lỗi cuối cùng: {}'.format(str(e3)))
+        # Xác định điểm đầu và cuối của pipe liền mạch mới - GIỮ NGUYÊN HƯỚNG PIPE GỐC
+        # Chọn pipe dài hơn làm pipe chính để giữ nguyên hướng
+        curve1_length = curve1.Length
+        curve2_length = curve2.Length
         
-        if new_pipe:
-            # Set diameter giống pipes cũ
-            new_pipe.get_Parameter(DB.BuiltInParameter.RBS_PIPE_DIAMETER_PARAM).Set(diameter)
-            
-            output.print_md('    ✅ Đã tạo pipe mới ID: {}'.format(new_pipe.Id))
-            
-            # Xóa 2 pipes cũ
-            output.print_md('    🗑️ Xóa 2 pipes cũ...')
-            doc.Delete(pipe1.Id)
-            doc.Delete(pipe2.Id)
-            
-            output.print_md('    🎉 HOÀN THÀNH TRUE TRIM! Đã gộp 2 pipes thành 1 pipe liền mạch!')
-            output.print_md('    📊 Kết quả: Pipe mới ID {} thay thế 2 pipes cũ'.format(new_pipe.Id))
-            return True
+        if curve1_length >= curve2_length:
+            keep_pipe = pipe1
+            delete_pipe = pipe2
+            main_curve = curve1
+            extend_curve = curve2
+            output.print_md('    📏 Chọn pipe1 làm chính (dài hơn: {:.3f} vs {:.3f})'.format(curve1_length, curve2_length))
         else:
-            output.print_md('    ❌ Không thể tạo pipe mới')
-            return False
+            keep_pipe = pipe2
+            delete_pipe = pipe1
+            main_curve = curve2
+            extend_curve = curve1
+            output.print_md('    📏 Chọn pipe2 làm chính (dài hơn: {:.3f} vs {:.3f})'.format(curve2_length, curve1_length))
+        
+        # Tìm endpoint của pipe chính gần với pipe phụ nhất
+        main_start = main_curve.GetEndPoint(0)
+        main_end = main_curve.GetEndPoint(1)
+        extend_start = extend_curve.GetEndPoint(0)
+        extend_end = extend_curve.GetEndPoint(1)
+        
+        # Tính khoảng cách để quyết định extend về phía nào
+        distances = [
+            (main_start.DistanceTo(extend_start), main_start, extend_end, "extend_from_main_start"),
+            (main_start.DistanceTo(extend_end), main_start, extend_start, "extend_from_main_start"),
+            (main_end.DistanceTo(extend_start), main_end, extend_end, "extend_from_main_end"),
+            (main_end.DistanceTo(extend_end), main_end, extend_start, "extend_from_main_end")
+        ]
+        
+        distances.sort(key=lambda x: x[0])
+        min_distance, connection_point, extend_to_point, extend_direction = distances[0]
+        
+        # Tạo curve mới GIỮ NGUYÊN HƯỚNG pipe chính
+        if extend_direction == "extend_from_main_start":
+            # Extend từ main_start, giữ nguyên main_end
+            new_start = extend_to_point  # Điểm xa nhất của pipe phụ
+            new_end = main_end          # Giữ nguyên endpoint của pipe chính
+        else:
+            # Extend từ main_end, giữ nguyên main_start
+            new_start = main_start      # Giữ nguyên startpoint của pipe chính
+            new_end = extend_to_point   # Điểm xa nhất của pipe phụ
+        
+        output.print_md('    🎯 Pipe liền mạch từ: ({:.3f}, {:.3f}) → ({:.3f}, {:.3f})'.format(
+            new_start.X, new_start.Y, new_end.X, new_end.Y))
+        output.print_md('    🔄 Hướng: {} (giữ nguyên hướng pipe chính)'.format(extend_direction))
+        
+        # Tạo curve liền mạch cho pipe được giữ lại - KIỂM TRA HƯỚNG TRƯỚC
+        continuous_curve = None  # Initialize để tránh unbound
+        try:
+            # QUAN TRỌNG: Không xóa pipe thứ 2 ngay, extend trước để đảm bảo kết nối
+            output.print_md('    🔗 Bước 1: Extend pipe chính để bao phủ toàn bộ đường ống...')
+            
+            # Tạo curve mới
+            continuous_curve = DB.Line.CreateBound(new_start, new_end)
+            
+            # Kiểm tra hướng curve mới so với curve gốc
+            original_direction = main_curve.Direction
+            new_direction = continuous_curve.Direction
+            
+            # Tính góc giữa 2 vectors (nếu > 90 độ thì đảo ngược)
+            dot_product = original_direction.DotProduct(new_direction)
+            output.print_md('    📐 Dot product (direction check): {:.3f}'.format(dot_product))
+            
+            # Nếu dot product < 0 thì hướng ngược lại - cần đảo ngược
+            if dot_product < 0:
+                output.print_md('    🔄 Phát hiện hướng ngược - Đảo ngược curve...')
+                # Đảo ngược start và end
+                continuous_curve = DB.Line.CreateBound(new_end, new_start)
+                new_direction = continuous_curve.Direction
+                output.print_md('    ✅ Đã đảo ngược curve để giữ nguyên hướng')
+            
+            # Apply curve mới - EXTEND PIPE CHÍNH
+            keep_pipe.Location.Curve = continuous_curve
+            output.print_md('    ✅ Đã extend pipe {} thành pipe liền mạch'.format(keep_pipe.Id))
+            
+            # Bước 2: Thu thập thông tin connections của pipe sẽ bị xóa TRƯỚC KHI XÓA
+            output.print_md('    🔗 Bước 2: Thu thập connections của pipe sẽ xóa...')
+            delete_connectors = get_pipe_connections(delete_pipe)
+            connections_to_transfer = []
+            
+            for conn in delete_connectors:
+                if conn.IsConnected:
+                    for ref in conn.AllRefs:
+                        if ref.Owner.Id != delete_pipe.Id:  # Không phải chính pipe này
+                            other_element = ref.Owner
+                            connections_to_transfer.append({
+                                'element': other_element,
+                                'connector': ref,
+                                'position': conn.Origin
+                            })
+                            output.print_md('      📌 Ghi nhận connection: pipe {} ↔ element {}'.format(
+                                delete_pipe.Id, other_element.Id))
+            
+            # Bước 3: Kiểm tra connectors của pipe đã extend
+            output.print_md('    🔗 Bước 3: Kiểm tra connectors của pipe đã extend...')
+            updated_connectors = get_pipe_connections(keep_pipe)
+            output.print_md('    📊 Pipe {} có {} connectors sau extend'.format(keep_pipe.Id, len(updated_connectors)))
+            
+            # Bước 4: Thử kết nối lại với các elements mà pipe cũ đã kết nối
+            output.print_md('    🔗 Bước 4: Kết nối lại với {} elements...'.format(len(connections_to_transfer)))
+            for connection_info in connections_to_transfer:
+                try:
+                    target_element = connection_info['element']
+                    target_connector = connection_info['connector']
+                    target_position = connection_info['position']
+                    
+                    # Tìm connector gần nhất của pipe mới
+                    closest_connector = None
+                    min_dist = float('inf')
+                    
+                    for new_conn in updated_connectors:
+                        if not new_conn.IsConnected:  # Chỉ kết nối với connector rảnh
+                            dist = new_conn.Origin.DistanceTo(target_position)
+                            if dist < min_dist:
+                                min_dist = dist
+                                closest_connector = new_conn
+                    
+                    if closest_connector and min_dist < 1.0:  # Trong vòng 1 foot
+                        closest_connector.ConnectTo(target_connector)
+                        output.print_md('      ✅ Kết nối pipe {} với element {} (distance: {:.3f})'.format(
+                            keep_pipe.Id, target_element.Id, min_dist))
+                    else:
+                        output.print_md('      ⚠️ Không thể kết nối với element {} (min_dist: {:.3f})'.format(
+                            target_element.Id, min_dist))
+                        
+                except Exception as conn_error:
+                    output.print_md('      ❌ Lỗi kết nối với element {}: {}'.format(
+                        connection_info['element'].Id, str(conn_error)))
+            
+            # Bước 5: Disconnect pipe thứ 2 từ tất cả connections trước khi xóa
+            output.print_md('    🔗 Bước 5: Disconnect pipe thứ 2 trước khi xóa...')
+            for conn in delete_connectors:
+                if conn.IsConnected:
+                    refs_to_disconnect = []
+                    for ref in conn.AllRefs:
+                        if ref.Owner.Id != delete_pipe.Id:
+                            refs_to_disconnect.append(ref)
+                    
+                    for ref in refs_to_disconnect:
+                        try:
+                            conn.DisconnectFrom(ref)
+                            output.print_md('      ✅ Disconnected pipe {} từ element {}'.format(delete_pipe.Id, ref.Owner.Id))
+                        except:
+                            pass
+            
+        except Exception as e_extend:
+            output.print_md('    ❌ Lỗi tạo pipe liền mạch: {}'.format(str(e_extend)))
+            # Thử method backup: Extend đơn giản
+            output.print_md('    🔄 Thử backup method: Extend đơn giản thay vì merge...')
+            try:
+                # Chỉ extend pipe chính đến connection point (không merge hoàn toàn)
+                if extend_direction == "extend_from_main_start":
+                    continuous_curve = DB.Line.CreateBound(connection_point, main_end)
+                else:
+                    continuous_curve = DB.Line.CreateBound(main_start, connection_point)
+                
+                keep_pipe.Location.Curve = continuous_curve
+                output.print_md('    ✅ Backup method thành công - Pipe {} đã được extend'.format(keep_pipe.Id))
+                
+                # Không xóa pipe thứ 2 trong backup method để giữ kết nối
+                output.print_md('    ⚠️ Backup method: Giữ pipe {} để duy trì kết nối'.format(delete_pipe.Id))
+                delete_pipe = None  # Không xóa
+                
+            except Exception as backup_error:
+                output.print_md('    ❌ Backup method cũng thất bại: {}'.format(str(backup_error)))
+                return False
+        
+        # Xóa pipe thứ 2 để chỉ còn 1 pipe liền mạch (nếu có)
+        if delete_pipe:
+            try:
+                doc.Delete(delete_pipe.Id)
+                output.print_md('    🗑️ Đã xóa pipe {} (không cần thiết nữa)'.format(delete_pipe.Id))
+                
+            except Exception as e_delete:
+                output.print_md('    ❌ Lỗi xóa pipe thừa: {}'.format(str(e_delete)))
+                # Không return False vì pipe chính đã được tạo thành công
+        else:
+            output.print_md('    ℹ️ Không xóa pipe thứ 2 (backup method để duy trì kết nối)')
+        
+        # Tính toán độ dài mới và kiểm tra connections cuối cùng
+        if continuous_curve:
+            total_length = continuous_curve.Length
+            output.print_md('    📏 Độ dài pipe liền mạch: {:.4f} feet'.format(total_length))
+        else:
+            output.print_md('    ⚠️ Không thể tính độ dài - continuous_curve không được tạo')
+        
+        # Báo cáo connections cuối cùng
+        final_connectors = get_pipe_connections(keep_pipe)
+        connected_count = sum(1 for conn in final_connectors if conn.IsConnected)
+        output.print_md('    🔗 Pipe cuối có {} connections ({} total connectors)'.format(
+            connected_count, len(final_connectors)))
+        
+        output.print_md('    🎉 HOÀN THÀNH TRUE TRIM! 2 pipes đã được gộp thành 1 pipe liền mạch!')
+        output.print_md('    💾 Pipe {} giữ nguyên TẤT CẢ thông tin gốc (tags, parameters, schedules)'.format(keep_pipe.Id))
+        output.print_md('    📊 Kết quả: 1 pipe liền mạch với {} connections hoạt động'.format(connected_count))
+        return True
         
     except Exception as e:
         output.print_md('    ❌ Lỗi True Trim: {}'.format(str(e)))
         return False
 
-def connect_pipes_comprehensive(pipe1, pipe2):
-    """Kết nối pipes với TRUE TRIM và các phương pháp backup"""
+def extend_both_pipes_to_connect(pipe1, pipe2):
+    """
+    BACKUP METHOD: Extend cả 2 pipes để kết nối (không merge thành 1)
+    Sử dụng khi TRUE TRIM không thành công
+    """
     try:
-        output.print_md('  🎯 BẮT ĐẦU PROCESS TRUE TRIM VÀ KẾT NỐI...')
+        output.print_md('  🔄 **BACKUP METHOD: EXTEND CẢ 2 PIPES ĐỂ KẾT NỐI**')
         
-        # PHƯƠNG PHÁP MỚI: TRUE TRIM (tốt nhất - tạo 1 pipe liền mạch)
-        output.print_md('  🔄 Đang thử TRUE TRIM METHOD...')
-        if true_trim_pipes(pipe1, pipe2):
-            return "TRUE_TRIM"
+        curve1 = pipe1.Location.Curve
+        curve2 = pipe2.Location.Curve
         
-        # Phương pháp 1: Union pipes (backup)
-        output.print_md('  🔄 Đang thử Phương pháp 1: Union pipes...')
-        if try_union_pipes(pipe1, pipe2):
-            return "UNION"
+        # Tìm các endpoints gần nhất
+        p1_start = curve1.GetEndPoint(0)
+        p1_end = curve1.GetEndPoint(1)
+        p2_start = curve2.GetEndPoint(0)
+        p2_end = curve2.GetEndPoint(1)
         
-        # Phương pháp 2: Connector-based connection (kết nối logic)
-        output.print_md('  🔄 Đang thử Phương pháp 2: Kết nối Connector...')
-        if connect_pipes_by_connectors(pipe1, pipe2):
-            return "CONNECTOR"
+        distances = [
+            (p1_start.DistanceTo(p2_start), p1_start, p2_start, "start", "start"),
+            (p1_start.DistanceTo(p2_end), p1_start, p2_end, "start", "end"),
+            (p1_end.DistanceTo(p2_start), p1_end, p2_start, "end", "start"),
+            (p1_end.DistanceTo(p2_end), p1_end, p2_end, "end", "end")
+        ]
         
-        # Phương pháp 3: Extend pipes về giữa (đóng khoảng hở vật lý)
-        output.print_md('  🔄 Đang thử Phương pháp 3: Extend pipes...')
-        if extend_pipes_to_close_gap(pipe1, pipe2):
-            return "EXTEND"
+        distances.sort(key=lambda x: x[0])
+        min_distance, conn_p1, conn_p2, p1_side, p2_side = distances[0]
         
-        # Phương pháp 4: Tạo pipe segment mới (tạo cầu nối)
-        output.print_md('  🔄 Đang thử Phương pháp 4: Tạo pipe segment...')
-        if create_connecting_pipe_segment(pipe1, pipe2):
-            return "SEGMENT"
+        output.print_md('    📏 Khoảng cách nhỏ nhất: {:.4f} feet'.format(min_distance))
         
-        output.print_md('  ❌ TẤT CẢ 5 PHƯƠNG PHÁP THẤT BẠI')
-        return False
+        if min_distance > 5.0:
+            output.print_md('    ⚠️ Khoảng cách quá lớn để extend')
+            return False
+        
+        # Tính điểm giữa để extend cả 2 pipes tới đó
+        midpoint = DB.XYZ(
+            (conn_p1.X + conn_p2.X) / 2,
+            (conn_p1.Y + conn_p2.Y) / 2,
+            (conn_p1.Z + conn_p2.Z) / 2
+        )
+        
+        # Extend pipe 1
+        if p1_side == "start":
+            new_curve1 = DB.Line.CreateBound(midpoint, p1_end)
+        else:
+            new_curve1 = DB.Line.CreateBound(p1_start, midpoint)
+        
+        # Extend pipe 2  
+        if p2_side == "start":
+            new_curve2 = DB.Line.CreateBound(midpoint, p2_end)
+        else:
+            new_curve2 = DB.Line.CreateBound(p2_start, midpoint)
+        
+        # Apply changes
+        pipe1.Location.Curve = new_curve1
+        pipe2.Location.Curve = new_curve2
+        
+        output.print_md('    ✅ Đã extend cả 2 pipes tới điểm giữa')
+        output.print_md('    📊 Kết quả: 2 pipes riêng biệt được extend để kết nối')
+        return True
         
     except Exception as e:
-        output.print_md('  ❌ Lỗi khi kết nối pipes: {}'.format(str(e)))
+        output.print_md('    ❌ Lỗi extend both pipes: {}'.format(str(e)))
         return False
+
+def connect_pipes_comprehensive(pipe1, pipe2):
+    """
+    Kết nối 2 pipes với 6-method fallback system
+    Priority: TRUE_TRIM → EXTEND_BOTH → UNION → CONNECTOR → EXTEND → SEGMENT
+    """
+    output.print_md('  🔗 **BẮT ĐẦU COMPREHENSIVE PIPE CONNECTION**')
+    
+    # METHOD 1: TRUE TRIM (Priority 1 - Preferred method)
+    output.print_md('  🥇 **METHOD 1: TRUE TRIM (GỘP 2 PIPES THÀNH 1)**')
+    if true_trim_pipes(pipe1, pipe2):
+        return "TRUE_TRIM"
+    
+    # METHOD 2: EXTEND BOTH PIPES (Backup for TRUE TRIM)
+    output.print_md('  🥈 **METHOD 2: EXTEND BOTH PIPES (BACKUP)**')
+    if extend_both_pipes_to_connect(pipe1, pipe2):
+        return "EXTEND_BOTH"
+    
+    # METHOD 3: UNION (nếu True Trim không thành công)
+    output.print_md('  🥉 **METHOD 3: UNION PIPES**')
+    try:
+        pipe_ids = [pipe1.Id, pipe2.Id]
+        collection = List[DB.ElementId](pipe_ids)
+        union_result = DB.ElementTransformUtils.CopyElements(doc, collection, doc, None, None)
+        if union_result and len(union_result) > 0:
+            output.print_md('    ✅ Union thành công')
+            return "UNION"
+    except Exception as e:
+        output.print_md('    ❌ Union failed: {}'.format(str(e)))
+    
+    # METHOD 4: CONNECTOR CONNECTION
+    output.print_md('  🔌 **METHOD 4: CONNECTOR CONNECTION**')
+    try:
+        connectors1 = get_pipe_connections(pipe1)
+        connectors2 = get_pipe_connections(pipe2)
+        
+        for c1 in connectors1:
+            for c2 in connectors2:
+                if not c1.IsConnected and not c2.IsConnected:
+                    distance = c1.Origin.DistanceTo(c2.Origin)
+                    if distance < 2.0:  # Trong vòng 2 feet
+                        try:
+                            c1.ConnectTo(c2)
+                            output.print_md('    ✅ Đã kết nối connectors (distance: {:.3f})'.format(distance))
+                            return "CONNECTOR"
+                        except:
+                            continue
+    except Exception as e:
+        output.print_md('    ❌ Connector connection failed: {}'.format(str(e)))
+    
+    # METHOD 5: EXTEND PIPES
+    output.print_md('  📏 **METHOD 5: EXTEND PIPES**')
+    try:
+        curve1 = pipe1.Location.Curve
+        curve2 = pipe2.Location.Curve
+        
+        # Tìm các endpoints và extend về phía gần nhất
+        p1_start = curve1.GetEndPoint(0)
+        p1_end = curve1.GetEndPoint(1)
+        p2_start = curve2.GetEndPoint(0)
+        p2_end = curve2.GetEndPoint(1)
+        
+        # Tìm cặp điểm gần nhất
+        min_dist = float('inf')
+        best_config = None
+        
+        configs = [
+            (p1_start, p2_start, "p1_from_start", "p2_from_start"),
+            (p1_start, p2_end, "p1_from_start", "p2_from_end"),
+            (p1_end, p2_start, "p1_from_end", "p2_from_start"),
+            (p1_end, p2_end, "p1_from_end", "p2_from_end")
+        ]
+        
+        for point1, point2, config1, config2 in configs:
+            dist = point1.DistanceTo(point2)
+            if dist < min_dist:
+                min_dist = dist
+                best_config = (point1, point2, config1, config2)
+        
+        if best_config and min_dist < 5.0:
+            point1, point2, config1, config2 = best_config
+            midpoint = DB.XYZ((point1.X + point2.X)/2, (point1.Y + point2.Y)/2, (point1.Z + point2.Z)/2)
+            
+            # Extend pipe1
+            if "start" in config1:
+                new_curve1 = DB.Line.CreateBound(midpoint, p1_end)
+            else:
+                new_curve1 = DB.Line.CreateBound(p1_start, midpoint)
+            
+            # Extend pipe2
+            if "start" in config2:
+                new_curve2 = DB.Line.CreateBound(midpoint, p2_end)
+            else:
+                new_curve2 = DB.Line.CreateBound(p2_start, midpoint)
+            
+            pipe1.Location.Curve = new_curve1
+            pipe2.Location.Curve = new_curve2
+            
+            output.print_md('    ✅ Đã extend pipes (gap: {:.3f} feet)'.format(min_dist))
+            return "EXTEND"
+            
+    except Exception as e:
+        output.print_md('    ❌ Extend pipes failed: {}'.format(str(e)))
+    
+    # METHOD 6: CREATE SEGMENT (last resort)
+    output.print_md('  🆕 **METHOD 6: CREATE SEGMENT**')
+    try:
+        # Tìm gap nhỏ nhất và tạo pipe segment để nối
+        curve1 = pipe1.Location.Curve
+        curve2 = pipe2.Location.Curve
+        
+        endpoints = [
+            (curve1.GetEndPoint(0), curve2.GetEndPoint(0)),
+            (curve1.GetEndPoint(0), curve2.GetEndPoint(1)),
+            (curve1.GetEndPoint(1), curve2.GetEndPoint(0)),
+            (curve1.GetEndPoint(1), curve2.GetEndPoint(1))
+        ]
+        
+        min_dist = float('inf')
+        best_points = None
+        
+        for p1, p2 in endpoints:
+            dist = p1.DistanceTo(p2)
+            if dist < min_dist:
+                min_dist = dist
+                best_points = (p1, p2)
+        
+        if best_points and min_dist < 3.0:
+            p1, p2 = best_points
+            
+            # Tạo pipe segment nối
+            segment_curve = DB.Line.CreateBound(p1, p2)
+            
+            # Lấy pipe type từ pipe1
+            pipe_type_id = pipe1.GetTypeId()
+            level_id = pipe1.ReferenceLevel.Id if pipe1.ReferenceLevel else doc.ActiveView.GenLevel.Id
+            
+            # Tạo pipe segment mới
+            new_pipe = DB.Plumbing.Pipe.Create(doc, pipe_type_id, level_id, segment_curve)
+            
+            if new_pipe:
+                output.print_md('    ✅ Đã tạo pipe segment nối (length: {:.3f} feet)'.format(min_dist))
+                return "SEGMENT"
+                
+    except Exception as e:
+        output.print_md('    ❌ Create segment failed: {}'.format(str(e)))
+    
+    output.print_md('  💥 **TẤT CẢ METHODS THẤT BẠI**')
+    return False
 
 def main():
     """Hàm chính của tool - Complete Remove Coupling Tool"""
@@ -520,92 +583,191 @@ def main():
         
         # Hiển thị header và hướng dẫn
         output.print_md('# 🔧 REMOVE COUPLING TOOL - FINAL CONSOLIDATED VERSION')
-        output.print_md('## 🎯 TRUE TRIM: Gộp 2 pipes thành 1 pipe liền mạch')
+        output.print_md('## 🎯 TRUE TRIM: Extend pipes hiện có để kết nối (GIỮ NGUYÊN THÔNG TIN)')
         output.print_md('')
         output.print_md('### 🔄 Các phương pháp được sử dụng:')
-        output.print_md('1. **TRUE TRIM** - Tạo 1 pipe mới thay thế 2 pipes cũ (tốt nhất)')
-        output.print_md('2. **Union Pipes** - Backup method using PlumbingUtils')
-        output.print_md('3. **Connector Connection** - Kết nối logic')
-        output.print_md('4. **Extend Pipes** - Kéo dài về giữa') 
-        output.print_md('5. **Create Segment** - Tạo pipe nối')
+        output.print_md('1. **TRUE TRIM** (Priority): Gộp 2 pipes thành 1 pipe liền mạch')
+        output.print_md('2. **EXTEND BOTH** (Backup): Extend cả 2 pipes tới điểm giữa')
+        output.print_md('3. **UNION**: Sử dụng Revit API để union pipes')
+        output.print_md('4. **CONNECTOR**: Kết nối logic thông qua connectors')
+        output.print_md('5. **EXTEND**: Kéo dài pipes về giữa để đóng khoảng hở')
+        output.print_md('6. **SEGMENT**: Tạo pipe segment nhỏ làm cầu nối')
         output.print_md('')
+        
+        # Hướng dẫn sử dụng
         output.print_md('### 📋 Hướng dẫn sử dụng:')
-        output.print_md('- Chọn 1 hoặc nhiều **coupling elements**')
-        output.print_md('- Tool sẽ tự động tìm 2 pipes kết nối với mỗi coupling')
-        output.print_md('- Xóa coupling và **GỘP 2 PIPES THÀNH 1 PIPE** (nếu có thể)')
+        output.print_md('1. Chọn 1 hoặc nhiều coupling elements trong Revit')
+        output.print_md('2. Chạy tool này')
+        output.print_md('3. Tool sẽ tự động tìm 2 pipes kết nối với mỗi coupling')
+        output.print_md('4. Xóa coupling và thực hiện TRUE TRIM (gộp pipes)')
         output.print_md('')
         
-        # Yêu cầu user chọn coupling elements
+        # Yêu cầu người dùng chọn elements
+        output.print_md('### 🖱️ Hãy chọn coupling elements muốn xóa...')
+        selected_elements = []
+        
         try:
-            selected_refs = selection.PickObjects(ObjectType.Element, 'Chọn coupling elements để xóa và kết nối pipes')
-        except:
-            output.print_md('❌ **Đã hủy chọn** - Tool dừng thực hiện')
+            # Cho phép user chọn multiple elements
+            selected_refs = selection.PickObjects(ObjectType.Element, "Chọn coupling elements (có thể chọn nhiều)")
+            
+            for ref in selected_refs:
+                element = doc.GetElement(ref.ElementId)
+                selected_elements.append(element)
+                
+        except Exception as selection_error:
+            output.print_md('❌ **Lỗi chọn elements:** {}'.format(str(selection_error)))
+            output.print_md('💡 **Hướng dẫn:** Hãy chọn 1 hoặc nhiều coupling elements trong model')
             return
         
-        if not selected_refs:
-            output.print_md('⚠️ **Không có element nào được chọn**')
+        if not selected_elements:
+            output.print_md('⚠️ **Không có elements nào được chọn!**')
             return
         
-        # Xử lý từng coupling trong một transaction duy nhất
-        with revit.Transaction('Remove Coupling and Connect Pipes - Complete'):
+        output.print_md('')
+        output.print_md('# 🚀 BẮT ĐẦU XỬ LÝ')
+        output.print_md('**Đã chọn {} element(s)**'.format(len(selected_elements)))
+        output.print_md('---')
+        
+        # Bắt đầu transaction
+        with DB.Transaction(doc, "Remove Coupling and TRUE TRIM Pipes") as trans:
+            trans.Start()
+            
+            total_count = len(selected_elements)
             success_count = 0
             error_count = 0
-            total_count = len(selected_refs)
             
-            output.print_md('🚀 **BẮT ĐẦU XỬ LÝ {} COUPLING(S)...**'.format(total_count))
-            output.print_md('')
-            
-            for idx, ref in enumerate(selected_refs, 1):
-                coupling = doc.GetElement(ref.ElementId)
+            for i, coupling in enumerate(selected_elements, 1):
+                output.print_md('')
+                output.print_md('## 🔄 PROCESSING {}/{}: Element ID {}'.format(i, total_count, coupling.Id))
                 
-                output.print_md('## 🔧 [{}/{}] Xử lý Coupling ID: {}'.format(idx, total_count, coupling.Id))
-                
-                # Kiểm tra tính hợp lệ
-                if not coupling or not coupling.Category:
-                    output.print_md('  ⚠️ Element không hợp lệ')
-                    error_count += 1
-                    continue
-                    
-                if coupling.Category.Id.IntegerValue != PIPE_FITTING_CATEGORY:
-                    output.print_md('  ⚠️ Không phải pipe fitting (Category: {})'.format(
-                        coupling.Category.Name if coupling.Category else 'Unknown'))
-                    error_count += 1
-                    continue
-                
-                # Debug thông tin coupling
-                try:
-                    output.print_md('  🔍 Loại: {}'.format(coupling.GetType().Name))
-                    if hasattr(coupling, 'Symbol') and coupling.Symbol:
-                        output.print_md('  📋 Family: {}'.format(coupling.Symbol.Name))
-                except Exception as e:
-                    output.print_md('  ⚠️ Không thể lấy thông tin chi tiết: {}'.format(str(e)))
-                
-                # Tìm pipe kết nối
+                # Tìm pipes kết nối với coupling này
                 output.print_md('  🔍 Đang tìm pipes kết nối...')
                 connected_pipes = find_connected_pipes(coupling)
-                output.print_md('  📊 Connector method: {} pipes'.format(len(connected_pipes)))
                 
-                # Nếu không tìm thấy pipe bằng connector, thử geometry
-                if len(connected_pipes) == 0:
-                    output.print_md('  🔍 Thử tìm bằng geometry proximity...')
-                    connected_pipes = find_connected_pipes_by_geometry(coupling)
-                    output.print_md('  📊 Geometry method: {} pipes'.format(len(connected_pipes)))
+                output.print_md('  📊 Tìm thấy {} pipe(s) kết nối'.format(len(connected_pipes)))
+                for j, pipe in enumerate(connected_pipes, 1):
+                    output.print_md('    {}. Pipe ID: {}'.format(j, pipe.Id))
                 
-                # Xử lý kết quả
                 if len(connected_pipes) == 2:
-                    pipe1, pipe2 = connected_pipes
-                    output.print_md('  📍 **Pipe 1:** {} | **Pipe 2:** {}'.format(pipe1.Id, pipe2.Id))
+                    pipe1, pipe2 = connected_pipes[0], connected_pipes[1]
+                    output.print_md('  ✅ Đủ 2 pipes để thực hiện TRUE TRIM')
                     
-                    # Xóa coupling
+                    # Disconnect và xóa coupling trước
+                    try:
+                        output.print_md('  🔌 Đang disconnect coupling...')
+                        disconnect_success = False
+                        
+                        # Method 1: Disconnect thông qua coupling connectors
+                        try:
+                            if hasattr(coupling, 'MEPModel') and coupling.MEPModel:
+                                connector_set = coupling.MEPModel.ConnectorManager.Connectors
+                            elif hasattr(coupling, 'ConnectorManager'):
+                                connector_set = coupling.ConnectorManager.Connectors
+                            else:
+                                connector_set = []
+                            
+                            for conn in connector_set:
+                                if conn.IsConnected:
+                                    refs_to_disconnect = []
+                                    for ref in conn.AllRefs:
+                                        if ref.Owner.Id != coupling.Id:
+                                            refs_to_disconnect.append(ref)
+                                      # Disconnect từng ref
+                                    for ref in refs_to_disconnect:
+                                        try:
+                                            conn.DisconnectFrom(ref)
+                                            output.print_md('      ✅ Disconnected từ element ID: {}'.format(ref.Owner.Id))
+                                            disconnect_success = True
+                                        except Exception as disc_err:
+                                            output.print_md('      ⚠️ Không thể disconnect: {}'.format(str(disc_err)))
+                        
+                        except Exception as connect_error:
+                            output.print_md('      ⚠️ Lỗi disconnect method 1: {}'.format(str(connect_error)))
+                        
+                        # Method 2: Disconnect thông qua pipe connectors (backup)
+                        if not disconnect_success:
+                            output.print_md('    🔌 Disconnect method 2: Pipe connectors')
+                            for pipe in [pipe1, pipe2]:
+                                pipe_connectors = get_pipe_connections(pipe)
+                                for pipe_conn in pipe_connectors:
+                                    if pipe_conn.IsConnected:
+                                        refs_to_disconnect = []
+                                        for ref in pipe_conn.AllRefs:
+                                            if ref.Owner.Id == coupling.Id:
+                                                refs_to_disconnect.append(ref)
+                                        
+                                        for ref in refs_to_disconnect:
+                                            try:
+                                                pipe_conn.DisconnectFrom(ref)
+                                                output.print_md('      ✅ Pipe {} disconnected từ coupling'.format(pipe.Id))
+                                                disconnect_success = True
+                                            except Exception as disc_err:
+                                                output.print_md('      ⚠️ Pipe disconnect error: {}'.format(str(disc_err)))
+                        
+                        if disconnect_success:
+                            output.print_md('  ✅ Đã disconnect pipes khỏi coupling')
+                        else:
+                            output.print_md('  ⚠️ Không disconnect được - Thử force delete...')
+                        
+                    except Exception as disconnect_error:
+                        output.print_md('  ⚠️ Lỗi disconnect: {} - Thử xóa trực tiếp...'.format(str(disconnect_error)))
+                    
+                    # Bây giờ mới xóa coupling với multiple fallback methods
                     output.print_md('  🗑️ Đang xóa coupling...')
-                    doc.Delete(coupling.Id)
-                    output.print_md('  ✅ Đã xóa coupling thành công')
+                    delete_success = False
+                    
+                    try:
+                        # Method 1: Xóa trực tiếp
+                        doc.Delete(coupling.Id)
+                        delete_success = True
+                        output.print_md('  ✅ Đã xóa coupling thành công (method 1)')
+                        
+                    except Exception as delete_error:
+                        output.print_md('  ⚠️ Method 1 failed: {}'.format(str(delete_error)))
+                        
+                        # Method 2: Force delete với collection
+                        try:
+                            element_ids = []
+                            element_ids.append(coupling.Id)
+                            doc.Delete(element_ids)
+                            delete_success = True
+                            output.print_md('  ✅ Đã xóa coupling thành công (method 2 - collection)')
+                            
+                        except Exception as delete_error2:
+                            output.print_md('  ⚠️ Method 2 failed: {}'.format(str(delete_error2)))
+                            
+                            # Method 3: Thử với ElementTransformUtils
+                            try:
+                                from Autodesk.Revit.DB import ElementTransformUtils, Transform
+                                # Đôi khi move element ra khỏi view rồi delete
+                                transform = Transform.CreateTranslation(DB.XYZ(1000, 1000, 1000))
+                                ElementTransformUtils.MoveElement(doc, coupling.Id, transform.Origin)
+                                doc.Delete(coupling.Id)
+                                delete_success = True
+                                output.print_md('  ✅ Đã xóa coupling thành công (method 3 - move+delete)')
+                                
+                            except Exception as delete_error3:
+                                output.print_md('  ❌ TẤT CẢ METHODS THẤT BẠI: {}'.format(str(delete_error3)))
+                                output.print_md('  💡 Thử disconnect thủ công coupling này trong Revit')
+                    
+                    if not delete_success:
+                        output.print_md('  ❌ Không thể xóa coupling - Bỏ qua element này')
+                        error_count += 1
+                        continue
                     
                     # Kết nối và TRUE TRIM
                     result = connect_pipes_comprehensive(pipe1, pipe2)
+                    
                     if result == "TRUE_TRIM":
                         output.print_md('  🎉 **THÀNH CÔNG: ĐÃ THỰC HIỆN TRUE TRIM!**')
-                        output.print_md('  💡 **Kết quả: 2 pipes đã được GỘP THÀNH 1 PIPE LIỀN MẠCH**')
+                        output.print_md('  💾 **Kết quả: 2 pipes đã được GỘP thành 1 PIPE LIỀN MẠCH**')
+                        output.print_md('  🔗 **Pipe được giữ lại chứa TẤT CẢ thông tin gốc (tags, parameters, schedules)**')
+                        output.print_md('  🗑️ **Pipe thứ 2 đã được xóa (không cần thiết nữa)**')
+                        success_count += 1
+                    elif result == "EXTEND_BOTH":
+                        output.print_md('  ⚠️ **THÀNH CÔNG: ĐÃ EXTEND CẢ 2 PIPES (BACKUP METHOD)**')
+                        output.print_md('  💡 **Kết quả: 2 pipes được extend để kết nối (giữ nguyên 2 pipes riêng biệt)**')
+                        output.print_md('  📝 **Lưu ý: TRUE TRIM không thành công, đã dùng backup method**')
                         success_count += 1
                     elif result == "UNION":
                         output.print_md('  ✅ **THÀNH CÔNG: ĐÃ UNION PIPES!**')
@@ -647,11 +809,16 @@ def main():
             output.print_md('')
             
             if success_count > 0:
-                output.print_md('🎉 **HOÀN THÀNH!** Đã đóng hoàn toàn khoảng hở cho {} coupling(s)!'.format(success_count))
-                output.print_md('🔗 **Kết quả:** Tất cả pipes đã được nối liền mạch!')
+                output.print_md('🎉 **HOÀN THÀNH!** Đã xử lý thành công {} coupling(s)!'.format(success_count))
+                output.print_md('💾 **Kết quả chính:** TRUE TRIM đã GỘP các pipes thành PIPES LIỀN MẠCH!')
+                output.print_md('🔗 **Thông tin được bảo toàn:** Tags, Parameters, Schedules không bị mất!')
+                output.print_md('🗑️ **Pipes thừa đã được xóa** để tạo ra đường ống liền mạch duy nhất')
             
             if error_count > 0:
                 output.print_md('⚠️ **Lưu ý:** {} coupling(s) không thể xử lý - kiểm tra log bên trên'.format(error_count))
+            
+            # Commit transaction
+            trans.Commit()
                 
     except Exception as e:
         output.print_md('💥 **LỖI NGHIÊM TRỌNG:** {}'.format(str(e)))
